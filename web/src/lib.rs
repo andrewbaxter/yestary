@@ -2,10 +2,8 @@ use std::{
     rc::Rc,
     cell::{
         RefCell,
-        Cell,
     },
     collections::{
-        HashSet,
         HashMap,
     },
     fmt::Display,
@@ -24,13 +22,13 @@ use futures::{
 };
 use gloo::{
     console::console_dbg,
-    utils::window,
+    utils::{
+        window,
+    },
 };
 use js_sys::Uint8Array;
 use lunk::{
     EventGraph,
-    new_prim,
-    new_vec,
     Prim,
     ProcessingContext,
     link,
@@ -44,10 +42,8 @@ use rooting::{
 };
 use sequoia_openpgp::{
     parse::{
-        stream::DetachedVerifierBuilder,
         Parse,
     },
-    Cert,
     packet::{
         self,
         key::{
@@ -55,9 +51,7 @@ use sequoia_openpgp::{
             UnspecifiedRole,
         },
         Key,
-        signature::SignatureBuilder,
     },
-    crypto::mpi::PublicKey,
     Packet,
 };
 use serde::{
@@ -71,7 +65,6 @@ use tokio::{
 use wasm_bindgen::{
     prelude::{
         wasm_bindgen,
-        Closure,
     },
     JsCast,
     UnwrapThrowExt,
@@ -82,7 +75,6 @@ use wasm_streams::ReadableStream;
 use web_sys::{
     DragEvent,
     HtmlInputElement,
-    ReadableStreamDefaultReader,
     File,
 };
 
@@ -103,7 +95,7 @@ struct SerialStampInner {
 struct Stamp {
     hash: String,
     stamp: DateTime<Utc>,
-    yes: bool,
+    verified: bool,
 }
 
 // Wrong/missing in web-sys
@@ -119,24 +111,37 @@ extern "C" {
     pub fn value(this: &ReadableStreamDefaultReadResult) -> JsValue;
 }
 
-struct BinFile {
+struct MyFile {
     name: String,
-    size: usize,
-    received: Prim<usize>,
-    state: BinFileState,
-    stream: Option<Box<dyn ScopeValue>>,
+    state: Prim<Rc<FileState>>,
 }
 
-enum BinFileState {
+#[derive(Clone, Copy)]
+enum DocumentVerifiedState {
+    Unknown,
+    Yes(DateTime<Utc>),
+    No,
+}
+
+enum FileState {
     Init,
-    Receiving,
+    Inter {
+        _future_drop: Box<dyn ScopeValue>,
+    },
     Stamp {
         stamp: Stamp,
     },
     Document {
         hash: String,
+        verified: DocumentVerifiedState,
     },
     Error,
+}
+
+impl PartialEq for FileState {
+    fn eq(&self, other: &Self) -> bool {
+        return core::mem::discriminant(self) == core::mem::discriminant(other);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -168,189 +173,221 @@ impl<T, E> StrErrorContext2<T> for Result<T, E> {
     }
 }
 
-#[derive(Clone)]
-struct DoneFile {
-    name: String,
-    date: DateTime<Utc>,
-    yes: bool,
-}
-
 fn process_file(
     pc: &mut ProcessingContext,
     base_url: &String,
     public_keys:
         &Rc<RefCell<HashMap<String, broadcast::Receiver<Result<Key<PublicParts, UnspecifiedRole>, StrError>>>>>,
-    bin_files: &lunk::Vec<Rc<RefCell<BinFile>>>,
-    done_files: &lunk::Vec<DoneFile>,
+    files: &lunk::Vec<Rc<MyFile>>,
     file: File,
 ) {
-    let out = Rc::new(RefCell::new(BinFile {
-        name: file.name(),
-        size: file.size() as usize,
-        received: new_prim(pc, 0),
-        state: BinFileState::Init,
-        stream: None,
-    }));
-
-    enum ReadState {
-        Stamp {
-            data: Vec<u8>,
-        },
-        Document {
-            hash: Sha256,
-        },
-    }
-
-    let state = Rc::new(RefCell::new(match file.name().rsplitn(2, ".").next().unwrap_throw() {
+    match file.name().rsplitn(2, ".").next().unwrap_throw() {
         "notify_stamp" => {
-            ReadState::Stamp { data: vec![] }
+            process_stamp_file(pc, &base_url, &public_keys, &files, file);
         },
         _ => {
-            ReadState::Document { hash: Sha256::new() }
+            process_doc_file(pc, &files, file);
         },
-    }));
+    }
+}
+
+fn process_doc_file(pc: &mut ProcessingContext, files: &lunk::Vec<Rc<MyFile>>, file: File) {
+    let out = Rc::new(MyFile {
+        name: file.name(),
+        state: Prim::new(pc, Rc::new(FileState::Init)),
+    });
     let (cancel_set, cancel) = oneshot::channel::<()>();
+    let eg = pc.eg();
     spawn_local({
-        let stream = ReadableStream::into_stream(ReadableStream::from_raw(file.stream().dyn_into().unwrap_throw()));
+        let mut stream =
+            ReadableStream::into_stream(ReadableStream::from_raw(file.stream().dyn_into().unwrap_throw()));
+        let files = files.clone();
+        let out = out.clone();
         let body = async move {
-            match async move {
-                // Read data
-                while let Some(Ok(chunk)) = stream.next().await {
-                    let bytes = Uint8Array::from(chunk).to_vec();
-                    match &mut *state.borrow_mut() {
-                        ReadState::Stamp { data } => {
-                            data.extend(bytes);
-                        },
-                        ReadState::Document { hash } => {
-                            hash.input(&bytes);
-                        },
-                    }
-                }
-
-                // Compile/finish read data
-                let out_state;
-                match &mut *state.borrow_mut() {
-                    ReadState::Stamp { data } => {
-                        // Parse signature
-                        let outer_serial = serde_json::from_slice::<SerialStamp>(&data).context("Error deserializing stamp")?;
-                        let inner_serial =
-                            serde_json::from_str::<SerialStampInner>(
-                                &outer_serial.message,
-                            ).context("Error deserializing stamp inner")?;
-
-                        // Get associated key, download if haven't already
-                        let key: Key<PublicParts, _> =
-                            public_keys.borrow_mut().entry(outer_serial.key_fingerprint.clone()).or_insert_with(|| {
-                                let (res_set, res) = broadcast::channel(1);
-                                spawn_local(async move {
-                                    res_set.send(async move {
-                                        let key_json =
-                                            reqwasm::http::Request::get(
-                                                &format!("{}/api/key/{}", base_url, outer_serial.key_fingerprint),
-                                            )
-                                                .send()
-                                                .await
-                                                .context("Error during key request")?
-                                                .text()
-                                                .await
-                                                .context("Error reading key response")?;
-                                        return Ok(
-                                            packet::Key::from_bytes(
-                                                &hex::decode(&key_json).context("Error decoding key hex")?,
-                                            )
-                                                .context("Error parsing key from key bytes")?
-                                                .parts_into_public(),
-                                        );
-                                    }.await).unwrap_throw();
-                                });
-                                res
-                            }).recv().await.context("Error getting result from key channel")??;
-
-                        // Stamps are self-verifiable since they contain both the signature and message
-                        // (hash). We can confirm that a document is verified by matching its hash with
-                        // the hash in the stamp.
-                        let sig =
-                            match Packet::from_bytes(
-                                &hex::decode(&outer_serial.signature).context("Error decoding signature hex")?,
-                            ).context("Error reading signature packet")? {
-                                Packet::Signature(sig) => sig,
-                                x => return Err(
-                                    StrError(format!("Signature data is not a signature, got {:?}", x.tag())),
-                                ),
-                            };
-
-                        // Finish the row with the result
-                        out_state = BinFileState::Stamp { stamp: Stamp {
-                            hash: inner_serial.hash,
-                            stamp: inner_serial.stamp,
-                            yes: sig
-                                .verify_message(
-                                    &key,
-                                    &hex::decode(
-                                        &outer_serial.message,
-                                    ).context("Error parsing signature message hex")?,
-                                )
-                                .is_ok(),
-                        } };
-                    },
-                    ReadState::Document { hash } => {
-                        // Finish the row with the result
-                        out_state = BinFileState::Document { hash: hash.result_str() };
-                    },
-                };
-
-                // Match immediately processable file pairs
+            let mut hash = Sha256::new();
+            while let Some(Ok(chunk)) = stream.next().await {
+                let bytes = Uint8Array::from(chunk).to_vec();
+                hash.input(&bytes);
+            }
+            eg.event(|pc| {
                 let mut delete = vec![];
-                for (i, other) in bin_files.borrow().value().iter().enumerate() {
-                    let other2 = other.borrow();
-                    match other2.state {
-                        BinFileState::Document { hash: other_hash } => match out_state {
-                            BinFileState::Stamp { stamp } if other_hash == stamp.hash => {
-                                delete.push(i);
-                                done_files.push(pc, DoneFile {
-                                    name: other2.name,
-                                    date: stamp.stamp,
-                                    yes: stamp.yes,
-                                });
-                            },
-                            _ => { },
-                        },
-                        BinFileState::Stamp { stamp: other_stamp } => match out_state {
-                            BinFileState::Stamp { stamp } if other_stamp.hash == stamp.hash => {
-                                delete.push(i);
-                            },
-                            BinFileState::Document { hash } if other_stamp.hash == hash => {
-                                delete.push(i);
-                                done_files.push(pc, DoneFile {
-                                    name: out.borrow().name,
-                                    date: other_stamp.stamp,
-                                    yes: other_stamp.yes,
-                                });
-                            },
-                            _ => { },
+                let out_state;
+
+                // Finish the row with the result
+                let hash = hash.result_str();
+                let mut verified = DocumentVerifiedState::Unknown;
+                for (other_i, other) in files.borrow().value().iter().enumerate() {
+                    match other.state.borrow().get().as_ref() {
+                        FileState::Stamp { stamp: other_stamp } if other_stamp.hash == hash => {
+                            delete.push(other_i);
+                            verified = match other_stamp.verified {
+                                true => DocumentVerifiedState::Yes(other_stamp.stamp),
+                                false => DocumentVerifiedState::No,
+                            };
                         },
                         _ => { },
                     }
                 }
+                out_state = FileState::Document {
+                    hash: hash,
+                    verified: verified,
+                };
                 delete.sort();
                 delete.reverse();
                 for i in delete {
-                    bin_files.splice(pc, i, 1, vec![]);
+                    files.splice(pc, i, 1, vec![]);
                 }
 
                 // And in any case, finish the current element (may have been deleted above, ok)
-                let mut out = out.borrow_mut();
-                out.state = out_state;
-                out.received.set(pc, out.size);
-                out.stream = None;
-                return Ok(());
-            }.await {
+                out.state.set(pc, Rc::new(out_state));
+            });
+        };
+        async move {
+            select!{
+                _ = cancel =>(),
+                _ = body =>(),
+            }
+        }
+    });
+    out.state.set(pc, Rc::new(FileState::Inter { _future_drop: scope_any(defer::defer(move || {
+        cancel_set.send(()).unwrap_throw();
+    })) }));
+    files.push(pc, out);
+}
+
+fn process_stamp_file(
+    pc: &mut ProcessingContext,
+    base_url: &String,
+    public_keys:
+        &Rc<RefCell<HashMap<String, broadcast::Receiver<Result<Key<PublicParts, UnspecifiedRole>, StrError>>>>>,
+    files: &lunk::Vec<Rc<MyFile>>,
+    file: File,
+) {
+    let out = Rc::new(MyFile {
+        name: file.name(),
+        state: Prim::new(pc, Rc::new(FileState::Init)),
+    });
+    let (cancel_set, cancel) = oneshot::channel::<()>();
+    spawn_local({
+        let mut stream =
+            ReadableStream::into_stream(ReadableStream::from_raw(file.stream().dyn_into().unwrap_throw()));
+        let out = out.clone();
+        let files = files.clone();
+        let public_keys = public_keys.clone();
+        let base_url = base_url.clone();
+        let eg = pc.eg();
+        let body = async move {
+            let a = {
+                let eg = eg.clone();
+                let out = out.clone();
+                async move {
+                    let mut data = vec![];
+                    while let Some(Ok(chunk)) = stream.next().await {
+                        data.extend(Uint8Array::from(chunk).to_vec());
+                    }
+                    let outer_serial =
+                        serde_json::from_slice::<SerialStamp>(&data).context("Error deserializing stamp")?;
+                    let inner_serial =
+                        serde_json::from_str::<SerialStampInner>(
+                            &outer_serial.message,
+                        ).context("Error deserializing stamp inner")?;
+
+                    // Get associated key, download if haven't already
+                    let key: Key<PublicParts, _> =
+                        public_keys.borrow_mut().entry(outer_serial.key_fingerprint.clone()).or_insert_with(|| {
+                            let (res_set, res) = broadcast::channel(1);
+                            spawn_local(async move {
+                                res_set.send(async move {
+                                    let key_json =
+                                        reqwasm::http::Request::get(
+                                            &format!("{}/api/key/{}", base_url, outer_serial.key_fingerprint),
+                                        )
+                                            .send()
+                                            .await
+                                            .context("Error during key request")?
+                                            .text()
+                                            .await
+                                            .context("Error reading key response")?;
+                                    return Ok(
+                                        packet::Key::from_bytes(
+                                            &hex::decode(&key_json).context("Error decoding key hex")?,
+                                        )
+                                            .context("Error parsing key from key bytes")?
+                                            .parts_into_public(),
+                                    );
+                                }.await).unwrap_throw();
+                            });
+                            res
+                        }).recv().await.context("Error getting result from key channel")??;
+
+                    // Stamps are self-verifiable since they contain both the signature and message
+                    // (hash). We can confirm that a document is verified by matching its hash with
+                    // the hash in the stamp.
+                    let mut sig =
+                        match Packet::from_bytes(
+                            &hex::decode(&outer_serial.signature).context("Error decoding signature hex")?,
+                        ).context("Error reading signature packet")? {
+                            Packet::Signature(sig) => sig,
+                            x => return Err(
+                                StrError(format!("Signature data is not a signature, got {:?}", x.tag())),
+                            ),
+                        };
+                    let verified =
+                        sig
+                            .verify_message(
+                                &key,
+                                &hex::decode(&outer_serial.message).context("Error parsing signature message hex")?,
+                            )
+                            .is_ok();
+
+                    // Finish the row with the result
+                    eg.event(|pc| {
+                        let mut used_stamp = false;
+                        let mut stamp_index = None;
+                        for (other_i, other) in files.borrow().value().iter().enumerate() {
+                            let hash = match other.state.borrow().get().as_ref() {
+                                FileState::Document { hash: other_hash, .. } => {
+                                    other_hash.clone()
+                                },
+                                FileState::Stamp { stamp: other_stamp } if other_stamp.hash == inner_serial.hash => {
+                                    stamp_index = Some(other_i);
+                                    continue;
+                                },
+                                _ => {
+                                    continue;
+                                },
+                            };
+                            used_stamp = true;
+                            other.state.set(pc, Rc::new(FileState::Document {
+                                hash: hash,
+                                verified: match verified {
+                                    true => DocumentVerifiedState::Yes(inner_serial.stamp),
+                                    false => DocumentVerifiedState::No,
+                                },
+                            }));
+                        }
+                        if used_stamp {
+                            if let Some(i) = stamp_index {
+                                files.splice(pc, i, 1, vec![]);
+                            }
+                        } else {
+                            out.state.set(pc, Rc::new(FileState::Stamp { stamp: Stamp {
+                                hash: inner_serial.hash,
+                                stamp: inner_serial.stamp,
+                                verified: verified,
+                            } }));
+                        }
+                    });
+                    return Ok(());
+                }
+            };
+            match a.await {
                 Ok(_) => { },
                 Err(e) => {
-                    let mut out = out.borrow_mut();
                     console_dbg!("Error reading file", out.name, e);
-                    out.state = BinFileState::Error;
-                    return;
+                    eg.event(|pc| {
+                        out.state.set(pc, Rc::new(FileState::Error));
+                    });
                 },
             }
         };
@@ -361,24 +398,91 @@ fn process_file(
             }
         }
     });
-    out.borrow_mut().stream = Some(scope_any(defer::defer(move || {
+    out.state.set(pc, Rc::new(FileState::Inter { _future_drop: scope_any(defer::defer(move || {
         cancel_set.send(()).unwrap_throw();
-    })));
-    bin_files.push(pc, out);
+    })) }));
+    files.push(pc, out);
 }
 
-fn main_button() -> ScopeElement { }
-
-fn icon(name: &'static str) -> ScopeElement { }
+fn file_el(pc: &mut ProcessingContext, base_url: &String, f: &Rc<MyFile>) -> ScopeElement {
+    return el("div").classes(&["file"]).drop(|div| link!((
+        _pc = pc;
+        state = f.state.clone();
+        f = f.clone(),
+        div = div.clone(),
+        base_url = base_url.clone(),
+    ) {
+        div.mut_clear();
+        match state.borrow().get().as_ref() {
+            FileState::Init => {
+                div.mut_push(el("div").push(el("span").text(&f.name)));
+            },
+            FileState::Inter { .. } => {
+                div.mut_push(
+                    el(
+                        "div",
+                    ).extend(
+                        vec![
+                            el("svg")
+                                .classes(&["spinner"])
+                                .attr("viewBox", "0 0 1 1")
+                                .attr("xmlns", "http://www.w3.org/2000/svg")
+                                .attr("style", "width: 1cm; height: 1cm")
+                                .push(el("circle").attr("cx", "0.5").attr("cy", "0.5").attr("r", "0.35")),
+                            el("span").text(&f.name)
+                        ],
+                    ),
+                );
+            },
+            FileState::Stamp { .. } => {
+                div.mut_push(
+                    el("div").extend(vec![el("img").attr("src", "stamp.svg"), el("span").text(&f.name)]),
+                );
+            },
+            FileState::Document { hash, verified } => match verified {
+                DocumentVerifiedState::Unknown => {
+                    div.mut_push(
+                        el("a")
+                            .attr("href", &format!("{}/api/stamp/{}", base_url, hash))
+                            .attr("download", &format!("{}.stamp", f.name))
+                            .extend(vec![el("img").attr("src", "doc.svg"), el("span").text(&f.name)]),
+                    );
+                },
+                DocumentVerifiedState::Yes(stamp) => {
+                    div.mut_push(
+                        el(
+                            "div",
+                        ).extend(
+                            vec![
+                                el("img").attr("src", "yes.svg"),
+                                el("span").text(&f.name),
+                                el("time")
+                                    .attr("datetime", &stamp.to_rfc3339())
+                                    .text(&stamp.format("%Y-%m-%d").to_string())
+                            ],
+                        ),
+                    );
+                },
+                DocumentVerifiedState::No => {
+                    div.mut_push(
+                        el("div").extend(vec![el("img").attr("src", "no.svg"), el("span").text(&f.name)]),
+                    );
+                },
+            },
+            FileState::Error => {
+                div.mut_push(
+                    el("div").extend(vec![el("img").attr("src", "error.svg"), el("span").text(&f.name)]),
+                );
+            },
+        }
+    }));
+}
 
 #[wasm_bindgen(start)]
 fn main() {
     let eg = EventGraph::new();
     eg.event(|pc| {
-        let document = new_prim(pc, None);
-        let signature = new_prim(pc, None);
-        let bin_files: lunk::Vec<_> = new_vec(pc, vec![]);
-        let done_files: lunk::Vec<_> = new_vec(pc, vec![]);
+        let files: lunk::Vec<_> = lunk::Vec::new(pc, vec![]);
         let base_url = window().location().origin().unwrap_throw();
         let public_keys = Rc::new(RefCell::new(HashMap::new()));
         set_root(
@@ -388,121 +492,79 @@ fn main() {
                     .extend(
                         vec![
                             el("a")
-                                .attr("href", "https://github.com/andrewbaxter/notar")
+                                .attr("href", "https://github.com/andrewbaxter/yestify")
                                 .push(el("img").attr("src", "logo.svg"))
                         ],
                     ),
                 el("div")
-                    .classes(&["main-buttons"])
+                    .classes(&["file_button"])
                     .extend(
                         vec![
-                            el("div")
-                                .classes(&["file_button"])
-                                .push(
-                                    el(
-                                        "label",
-                                    ).push(
-                                        el("input")
-                                            .attr("type", "file")
-                                            .attr("multiple", "true")
-                                            .listen("change", |e| eg.event(|pc| {
-                                                let el =
-                                                    e
-                                                        .target()
-                                                        .unwrap_throw()
-                                                        .dyn_ref::<HtmlInputElement>()
-                                                        .unwrap_throw();
-                                                let files = el.files().unwrap_throw();
-                                                for i in 0 .. files.length() {
-                                                    process_file(
-                                                        pc,
-                                                        &base_url,
-                                                        &public_keys,
-                                                        &bin_files,
-                                                        &done_files,
-                                                        files.get(i).unwrap_throw(),
-                                                    );
-                                                }
-                                            })),
-                                    ),
-                                )
-                                .listen("dragover", |e| {
-                                    e.prevent_default();
+                            el(
+                                "label",
+                            ).extend(vec![el("input").attr("type", "file").attr("multiple", "true").on("change", {
+                                let base_url = base_url.clone();
+                                let public_keys = public_keys.clone();
+                                let files = files.clone();
+                                let eg = pc.eg();
+                                move |e| eg.event(|pc| {
+                                    let e = e.target().unwrap_throw();
+                                    let el = e.dyn_ref::<HtmlInputElement>().unwrap_throw();
+                                    let js_files = el.files().unwrap_throw();
+                                    for i in 0 .. js_files.length() {
+                                        let file = js_files.get(i).unwrap_throw();
+                                        process_file(pc, &base_url, &public_keys, &files, file);
+                                    }
                                 })
-                                .listen("drop", |e| eg.event(|pc| {
-                                    e.prevent_default();
-                                    let e = e.dyn_ref::<DragEvent>().unwrap_throw();
-                                    let datatransfer = e.data_transfer().unwrap_throw();
-                                    if let Some(files) = datatransfer.files() {
-                                        for i in 0 .. files.length() {
-                                            process_file(
-                                                pc,
-                                                &base_url,
-                                                &public_keys,
-                                                &bin_files,
-                                                &done_files,
-                                                files.get(i).unwrap_throw(),
-                                            );
-                                        }
-                                    }
-                                    let items = datatransfer.items();
-                                    for i in 0 .. items.length() {
-                                        let Some(
-                                            file
-                                        ) = items.get(i).unwrap_throw().get_as_file().unwrap_throw() else {
-                                            continue;
-                                        };
-                                        process_file(pc, &base_url, &public_keys, &bin_files, &done_files, file);
-                                    }
-                                })),
-                            main_button().classes(&["button_clear"]).push(icon("clear")).drop(|e| {
+                            }), el("img").attr("src", "drop.svg")]),
+                            el("div").drop(|e| {
                                 link!((
                                     pc = pc;
-                                    bin_files = bin_files.clone();
+                                    files = files.clone();
+                                    base_url = base_url.clone(),
                                     e = e.clone()
                                 ) {
-                                    let classes = ["disable"];
-                                    if bin_files.borrow().value().is_empty() {
-                                        e.mut_classes(&classes);
-                                    } else {
-                                        e.mut_remove_classes(&classes);
-                                    }
-                                })
-                            }).listen("click", move |_| {
-                                eg.event(|pc| {
-                                    bin_files.clear(pc);
-                                });
-                            }),
-                            main_button().push(icon("stamp")).drop(|e| {
-                                link!((
-                                    pc = pc;
-                                    bin_files = bin_files.clone();
-                                    e = e.clone()
-                                ) {
-                                    let classes = ["disable"];
-                                    if !bin_files
-                                        .borrow()
-                                        .value()
-                                        .iter()
-                                        .map(|x| matches!(x.borrow().state, BinFileState::Document { .. }))
-                                        .next()
-                                        .unwrap_or(false) {
-                                        e.mut_classes(&classes);
-                                    } else {
-                                        e.mut_remove_classes(&classes);
-                                    }
-                                })
-                            }).listen("click", move |_| {
-                                eg.event(|pc| {
-                                    for f in bin_files.borrow().value() {
-                                        match f.borrow().state {
-                                            BinFileState::Document { hash } => todo!(),
-                                        }
+                                    for c in files.borrow().changes() {
+                                        e.mut_splice(c.offset, c.remove, c.add.iter().map(|f| {
+                                            return file_el(pc, &base_url, f);
+                                        }).collect());
                                     }
                                 });
                             })
                         ],
-                    ),
+                    )
+                    .on("dragover", |e| {
+                        e.prevent_default();
+                    })
+                    .on("drop", {
+                        let public_keys = public_keys.clone();
+                        let files = files.clone();
+                        let base_url = base_url.clone();
+                        let eg = pc.eg();
+                        move |e| eg.event(|pc| {
+                            e.prevent_default();
+                            let e = e.dyn_ref::<DragEvent>().unwrap_throw();
+                            let datatransfer = e.data_transfer().unwrap_throw();
+                            if let Some(js_files) = datatransfer.files() {
+                                for i in 0 .. js_files.length() {
+                                    process_file(
+                                        pc,
+                                        &base_url,
+                                        &public_keys,
+                                        &files,
+                                        js_files.get(i).unwrap_throw(),
+                                    );
+                                }
+                            }
+                            let items = datatransfer.items();
+                            for i in 0 .. items.length() {
+                                let Some(file) = items.get(i).unwrap_throw().get_as_file().unwrap_throw() else {
+                                    continue;
+                                };
+                                process_file(pc, &base_url, &public_keys, &files, file);
+                            }
+                        })
+                    }),
                 el("div").classes(&["main-list"]),
                 el("div")
                     .classes(&["footer"])

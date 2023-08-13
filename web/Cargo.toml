@@ -17,7 +17,7 @@ serde = { version = "1.0.183", features = ["derive"] }
 serde_json = "1.0.104"
 wasm-bindgen = "0.2.87"
 wasm-bindgen-futures = "0.4.37"
-web-sys = { version = "0.3.64", features = ["DataTransfer", "DataTransferItem", "DataTransferItemList", "DragEvent", "HtmlInputElement", "ReadableStreamDefaultReader", "Location"] }
+web-sys = { version = "0.3.64", features = ["DataTransfer", "DataTransferItem", "DataTransferItemList", "DragEvent", "HtmlInputElement", "ReadableStreamDefaultReader", "Location", "Url"] }
 sequoia-openpgp = { version = "*", default-features = false, features = [
     "crypto-rust",
     "allow-experimental-crypto",
