@@ -1208,7 +1208,9 @@ checksum = "b06a4cde4c0f271a446782e3eff8de789548ce57dbc8eca9292c27f4a42004b4"
 
 [[package]]
 name = "lunk"
-version = "0.1.1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af99b8aa24d4d951b112f9daeb342c24a2547a4b30840a90a4cb3d2eaf7363c9"
 dependencies = [
  "paste",
 ]
@@ -1671,7 +1673,9 @@ dependencies = [
 
 [[package]]
 name = "rooting"
-version = "0.1.4"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3cf9cedde8fafebdf09ecee680725e03cc1403ce116fa14b7975c7c81692125"
 dependencies = [
  "gloo-events",
  "gloo-utils",
