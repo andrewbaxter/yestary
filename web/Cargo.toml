@@ -12,12 +12,20 @@ js-sys = "0.3.64"
 lunk = { path = "../../linkos" }
 reqwasm = { version = "0.5.0", features = ["json"] }
 rooting = { path = "../../rooting" }
-rust-crypto = "0.2.36"
 serde = { version = "1.0.183", features = ["derive"] }
 serde_json = "1.0.104"
 wasm-bindgen = "0.2.87"
 wasm-bindgen-futures = "0.4.37"
-web-sys = { version = "0.3.64", features = ["DataTransfer", "DataTransferItem", "DataTransferItemList", "DragEvent", "HtmlInputElement", "ReadableStreamDefaultReader", "Location", "Url"] }
+web-sys = { version = "0.3.64", features = [
+    "DataTransfer",
+    "DataTransferItem",
+    "DataTransferItemList",
+    "DragEvent",
+    "HtmlInputElement",
+    "ReadableStreamDefaultReader",
+    "Location",
+    "Url",
+] }
 sequoia-openpgp = { version = "*", default-features = false, features = [
     "crypto-rust",
     "allow-experimental-crypto",
@@ -28,3 +36,5 @@ futures = "0.3.28"
 tokio = { version = "1.30.0", features = ["macros", "sync"] }
 hex = "0.4.3"
 defer = "0.1.0"
+shared = { path = "../shared" }
+sha2 = "0.10.7"
